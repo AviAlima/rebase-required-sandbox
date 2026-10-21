@@ -1,0 +1,152 @@
+name: Update stale PRs
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Merged PR whose merge commit open PRs must contain
+        required: true
+        type: string
+      dry_run:
+        description: Only list the PRs that would be updated
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  update-stale-prs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update stale PRs
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const MAX_PR_AGE_DAYS = 30
+            const REQUIRED_LABEL = 'rebase-required'
+            const PR_LOOKUP_ATTEMPTS = 6
+            const PR_LOOKUP_DELAY_MS = 10000
+            const dryRun = process.env.DRY_RUN === 'true'
+
+            const findSourcePrForPush = async () => {
+              for (let attempt = 1; attempt <= PR_LOOKUP_ATTEMPTS; attempt++) {
+                const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({ ...context.repo, commit_sha: context.sha })
+                const sourcePr = prs.find((pr) => pr.merge_commit_sha === context.sha)
+                if (sourcePr) return sourcePr
+                if (attempt < PR_LOOKUP_ATTEMPTS) await new Promise((resolve) => setTimeout(resolve, PR_LOOKUP_DELAY_MS))
+              }
+              return undefined
+            }
+
+            let sourcePr
+            if (context.eventName === 'workflow_dispatch') {
+              const pullNumber = Number(process.env.PR_NUMBER)
+              const { data } = await github.rest.pulls.get({ ...context.repo, pull_number: pullNumber })
+              if (!data.merged) {
+                core.setFailed(`PR #${pullNumber} is not merged`)
+                return
+              }
+              sourcePr = data
+            } else {
+              sourcePr = await findSourcePrForPush()
+              if (!sourcePr) {
+                core.warning(`No merged PR found for commit ${context.sha} after ${PR_LOOKUP_ATTEMPTS} attempts, nothing to do`)
+                return
+              }
+            }
+
+            if (!sourcePr.labels.some((label) => label.name === REQUIRED_LABEL)) {
+              core.info(`PR #${sourcePr.number}: no ${REQUIRED_LABEL} label, nothing to do`)
+              return
+            }
+
+            const requiredSha = context.eventName === 'push' ? context.sha : sourcePr.merge_commit_sha
+            const repoFullName = `${context.repo.owner}/${context.repo.repo}`
+            const minCreatedAt = Date.now() - MAX_PR_AGE_DAYS * 24 * 60 * 60 * 1000
+            core.info(`Source PR #${sourcePr.number}, required commit ${requiredSha}, dry run: ${dryRun}`)
+
+            const openPrs = await github.paginate(github.rest.pulls.list, {
+              ...context.repo,
+              state: 'open',
+              base: 'master',
+              per_page: 100,
+            })
+
+            const updated = []
+            const skipped = []
+            const failed = []
+
+            for (const pr of openPrs) {
+              if (pr.head.repo?.full_name !== repoFullName) {
+                skipped.push(`#${pr.number}: fork`)
+                continue
+              }
+              if (new Date(pr.created_at).getTime() < minCreatedAt) {
+                skipped.push(`#${pr.number}: older than ${MAX_PR_AGE_DAYS} days`)
+                continue
+              }
+
+              let compareStatus
+              try {
+                const { data } = await github.rest.repos.compareCommitsWithBasehead({
+                  ...context.repo,
+                  basehead: `${requiredSha}...${pr.head.sha}`,
+                })
+                compareStatus = data.status
+              } catch (error) {
+                core.warning(`#${pr.number}: ${error.status} ${error.message}`)
+                failed.push(`#${pr.number}: compare ${error.status} ${error.message}`)
+                continue
+              }
+              if (compareStatus !== 'behind' && compareStatus !== 'diverged') {
+                skipped.push(`#${pr.number}: already contains ${requiredSha} (${compareStatus})`)
+                continue
+              }
+
+              if (dryRun) {
+                core.info(`#${pr.number}: would update`)
+                updated.push(`#${pr.number}`)
+                continue
+              }
+
+              try {
+                await github.rest.pulls.updateBranch({
+                  ...context.repo,
+                  pull_number: pr.number,
+                  expected_head_sha: pr.head.sha,
+                })
+                for (let i = 0; i < 24; i++) {
+                  await new Promise((resolve) => setTimeout(resolve, 5000))
+                  const { data: fresh } = await github.rest.pulls.get({ ...context.repo, pull_number: pr.number })
+                  if (fresh.head.sha !== pr.head.sha) break
+                }
+                await github.rest.actions.createWorkflowDispatch({ ...context.repo, workflow_id: 'ci.yml', ref: pr.head.ref })
+                core.info(`#${pr.number}: updated`)
+                updated.push(`#${pr.number}`)
+              } catch (error) {
+                core.warning(`#${pr.number}: ${error.status} ${error.message}`)
+                failed.push(`#${pr.number}: ${error.status} ${error.message}`)
+              }
+            }
+
+            await core.summary
+              .addHeading('Update stale PRs')
+              .addRaw(`Source PR: #${sourcePr.number} ${sourcePr.title}`, true)
+              .addRaw(`Required commit: ${requiredSha}`, true)
+              .addRaw(`Dry run: ${dryRun}`, true)
+              .addHeading(dryRun ? 'Would update' : 'Updated', 3)
+              .addList(updated.length ? updated : ['none'])
+              .addHeading('Skipped', 3)
+              .addList(skipped.length ? skipped : ['none'])
+              .addHeading('Failed', 3)
+              .addList(failed.length ? failed : ['none'])
+              .write()
