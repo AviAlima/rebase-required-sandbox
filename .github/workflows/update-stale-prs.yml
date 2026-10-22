@@ -28,6 +28,7 @@ jobs:
         env:
           PR_NUMBER: ${{ inputs.pr_number }}
           DRY_RUN: ${{ inputs.dry_run }}
+          SIM_LOOKUP_FAILURES: ${{ vars.SIM_LOOKUP_FAILURES }}
         with:
           github-token: ${{ github.token }}
           script: |
@@ -38,12 +39,21 @@ jobs:
             const dryRun = process.env.DRY_RUN === 'true'
 
             const findSourcePrForPush = async () => {
+              let lastError
               for (let attempt = 1; attempt <= PR_LOOKUP_ATTEMPTS; attempt++) {
-                const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({ ...context.repo, commit_sha: context.sha })
-                const sourcePr = prs.find((pr) => pr.merge_commit_sha === context.sha)
-                if (sourcePr) return sourcePr
+                try {
+                  if (attempt <= Number(process.env.SIM_LOOKUP_FAILURES || 0)) throw Object.assign(new Error('simulated API failure'), { status: 500 })
+                  const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({ ...context.repo, commit_sha: context.sha })
+                  const sourcePr = prs.find((pr) => pr.merge_commit_sha === context.sha)
+                  if (sourcePr) return sourcePr
+                  lastError = undefined
+                } catch (error) {
+                  lastError = error
+                  core.warning(`PR lookup attempt ${attempt} failed: ${error.status} ${error.message}`)
+                }
                 if (attempt < PR_LOOKUP_ATTEMPTS) await new Promise((resolve) => setTimeout(resolve, PR_LOOKUP_DELAY_MS))
               }
+              if (lastError) throw lastError
               return undefined
             }
 
